@@ -7,215 +7,332 @@ Parameters:
   VpcId:
     Type: AWS::EC2::VPC::Id
     Description: Id of the VPC into which to deploy the Jenkins Master
-  SubnetIds:
+
+  PublicSubnetIds:
+    Type: "List<AWS::EC2::Subnet::Id>"
+    Description: The subnet into which to deploy the Load Balancer
+
+  PrivateSubnetIds:
     Type: "List<AWS::EC2::Subnet::Id>"
     Description: The subnet into which to deploy the Jenkins Master
-  AdminSecurityGroup:
-    Type: "AWS::EC2::SecurityGroup::Id"
-    Description: The subnet into which to deploy the Jenkins Master
-  JenkinsRole:
+
+  DnsZoneId:
     Type: String
-    Description: IAM Role with permission to read from the Private Bucket.
-  PrivateBucket:
+    Description: Id of the Route 53 hosted zone.
+
+  DnsZoneName:
     Type: String
-    Description: S3 bucket containing secrets
-  Ec2KeyName:
-    Type: AWS::EC2::KeyPair::KeyName
-    Description: EC2 Key Pair to install on EC2 instances
+    Description: >-
+      Name of the Route 53 hosted zone (Do not apend a dot at the end.)
+
+  DnsRecordName:
+    Type: String
+    Description: Record name (without domain) for the Jenkins master service.
+
+  CertificateSanName:
+    Type: String
+    Description: >-
+      Record name (without domain) for an alias in the same hosted zone
+      that may be used to address the Jenkins master service.
+    Default: jenkins
+
+  ClientCidrList:
+    Type: List<String>
+    Description: Addresses ranges for clients in CIDR notation.
+
+Conditions:
+  Have2PrivateSubnets:
+    !Not [!Equals ["", !Select [1, !Split [",", !Join ["", [!Join [",", !Ref PrivateSubnetIds], ",,,"]]]]]]
+  Have3PrivateSubnets:
+    !Not [!Equals ["", !Select [2, !Split [",", !Join ["", [!Join [",", !Ref PrivateSubnetIds], ",,,"]]]]]]
+  Have4PrivateSubnets:
+    !Not [!Equals ["", !Select [3, !Split [",", !Join ["", [!Join [",", !Ref PrivateSubnetIds], ",,,"]]]]]]
 
 Resources:
-  JenkinsInstanceProfile:
-    Type: AWS::IAM::InstanceProfile
+
+  MasterSslCertificate:
+    Type: AWS::CertificateManager::Certificate
     Properties:
-      InstanceProfileName: !Sub '${AWS::StackName}-JenkinsMaster'
-      Roles: [ !Ref JenkinsRole ]
+      DomainName: !Sub ${DnsRecordName}.${DnsZoneName}
+      SubjectAlternativeNames:
+        - !Sub ${CertificateSanName}.${DnsZoneName}
+      DomainValidationOptions:
+        - DomainName: !Sub ${DnsRecordName}.${DnsZoneName}
+          HostedZoneId: !Ref DnsZoneId
+        - DomainName: !Sub ${CertificateSanName}.${DnsZoneName}
+          HostedZoneId: !Ref DnsZoneId
+      ValidationMethod: DNS
 
-  JenkinsMaster0:
-    Type: AWS::EC2::Instance
-    Metadata:
-      AWS::CloudFormation::Authentication:
-        S3AccessCreds:
-          type: S3
-          roleName: !Ref JenkinsRole
-          buckets: [ !Ref PrivateBucket ]
-      AWS::CloudFormation::Init:
-        config:
-          files:
-
-            /etc/secrets/jenkins.id_ed25519:
-              source: !Sub 'https://${PrivateBucket}.s3.amazonaws.com/jenkins.id_ed25519'
-              owner: root
-              group: root
-              mode: '000400'
-
-            /etc/secrets/jenkins.id_rsa:
-              source: !Sub 'https://${PrivateBucket}.s3.amazonaws.com/jenkins.id_rsa'
-              owner: root
-              group: root
-              mode: '000400'
-
-            /etc/pki/tls/certs/jenkins.pem:
-              source: !Sub 'https://${PrivateBucket}.s3.amazonaws.com/jenkins.pem'
-              owner: root
-              group: root
-              mode: '000644'
-
-            /etc/pki/tls/private/jenkins.key:
-              source: !Sub 'https://${PrivateBucket}.s3.amazonaws.com/jenkins.key'
-              owner: root
-              group: root
-              mode: '000400'
-
-            /etc/secrets/jdk-8u211-linux-x64.tar.gz:
-              source: !Sub 'https://${PrivateBucket}.s3.amazonaws.com/jdk-8u211-linux-x64.tar.gz'
-              owner: root
-              group: root
-              mode: '000400'
-
-            /etc/chef-repo/cfn_params.json:
-              content:
-                Fn::Join:
-                  - "\n"
-                  -
-                    - '{'
-                    -   '  "java": { "jdk": { "8": { "x86_64": { "url": "file:///etc/secrets/jdk-8u211-linux-x64.tar.gz" }}}},'
-                    - !Sub '  "tsos-app-jenkins-master": { "jenkins_share":"${EfsFileSystem}.efs.${AWS::Region}.amazonaws.com:/" }'
-                    - '}'
-              owner: root
-              group: root
-              mode: '000400'
-
-          sources:
-            /etc/chef-repo: !Sub 'https://${PrivateBucket}.s3.amazonaws.com/tsos-app-jenkins-master.tgz'
-
-    CreationPolicy:
-      ResourceSignal:
-        Timeout: PT15M
-    DependsOn: EfsMountTarget
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
     Properties:
-      ImageId: ami-01bbe152bf19d0289
-      InstanceType: 't3.small'
-      IamInstanceProfile: !Ref JenkinsInstanceProfile
-      NetworkInterfaces:
-      - DeviceIndex: '0'
-        GroupSet:
-        - !Ref AdminSecurityGroup
-        - !Ref JenkinsMasterSecurityGroup
-        SubnetId: !Select [ 0, !Ref SubnetIds ]
-      KeyName: !Ref Ec2KeyName
-      Tags:
-      - Key: Name
-        Value: !Sub '${AWS::StackName}-JenkinsMaster'
-      UserData:
-        Fn::Base64:
-          Fn::Sub: |-
-            #!/bin/bash -xe
-            exec &>>/var/log/userdata.log
-            env >/var/log/userdata.env
-            /opt/aws/bin/cfn-init -v -s ${AWS::StackName} -r JenkinsMaster0 --region ${AWS::Region}
-            curl -L https://omnitruck.chef.io/install.sh | sudo bash -s
-            cd /etc/chef-repo
-            # FIXME: Remove data bag dependency from tsos-config instead of setting TEST_KITCHEN env var.
-            CHEF_LICENSE=accept-no-persist chef-client -z -j cfn_params.json
-            /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource JenkinsMaster0 --region ${AWS::Region}
-            touch /userdata-successful
+      GroupDescription: Allow ELB to route traffic to Jenkins Master.
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: 443
+        ToPort: 443
+        CidrIp: 0.0.0.0/0
 
-  JenkinsEIP:
-    Type: AWS::EC2::EIP
+  AppLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
     Properties:
-      Domain: vpc
+      Type: application
+      Subnets: !Ref PublicSubnetIds
+      SecurityGroups: [ !Ref AlbSecurityGroup ]
 
-  JenkinsEIPAssociation:
-    Type: AWS::EC2::EIPAssociation
+  MasterTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
     Properties:
-      AllocationId: !GetAtt JenkinsEIP.AllocationId
-      InstanceId: !Ref JenkinsMaster0
+      Protocol: HTTP
+      Port: 8080
+      HealthCheckPath: /login
+      VpcId: !Ref VpcId
+      TargetType: ip
 
-  JenkinsDnsRecord:
+  AlbHttpsListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      Certificates:
+      - CertificateArn: !Ref MasterSslCertificate
+      DefaultActions:
+      - Type: fixed-response
+        FixedResponseConfig:
+          StatusCode: 403
+      LoadBalancerArn: !Ref AppLoadBalancer
+      Port: 443
+      Protocol: HTTPS
+
+  AlbHttpsListenerAdminRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      Priority: 10
+      ListenerArn: !Ref AlbHttpsListener
+      Actions:
+      - Type: forward
+        ForwardConfig:
+          TargetGroups:
+          - TargetGroupArn: !Ref MasterTargetGroup
+      Conditions:
+      - Field: source-ip
+        SourceIpConfig:
+          # Values: [ 137.229.6.64/26 ]
+          Values: !Ref ClientCidrList
+
+  # FIXME: Temporarily allow UA for troubleshooting.
+  AlbHttpsListenerAdminRuleTMP:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      Priority: 11
+      ListenerArn: !Ref AlbHttpsListener
+      Actions:
+      - Type: forward
+        ForwardConfig:
+          TargetGroups:
+          - TargetGroupArn: !Ref MasterTargetGroup
+      Conditions:
+      - Field: source-ip
+        SourceIpConfig:
+          Values: [ 137.229.0.0/16 ]
+
+  AlbHttpsListenerWebhookRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      Priority: 20
+      ListenerArn: !Ref AlbHttpsListener
+      Actions:
+      - Type: forward
+        ForwardConfig:
+          TargetGroups:
+          - TargetGroupArn: !Ref MasterTargetGroup
+      Conditions:
+      - Field: path-pattern
+        PathPatternConfig:
+          Values: [ /github-webhook/ ]
+
+  MasterCname:
     Type: AWS::Route53::RecordSet
-    DependsOn: JenkinsEIPAssociation
-    # Condition: SomeCondition
     Properties:
-      # FIXME: Make hostname configurable.
-      HostedZoneName: aws.alaska.edu.
-      Name: jenkins-19.aws.alaska.edu.
+      HostedZoneName: !Sub ${DnsZoneName}.
+      Name: !Sub ${DnsRecordName}.${DnsZoneName}
+      Comment: Jenkins Master
       Type: CNAME
-      TTL: '900'
+      TTL: 300
       ResourceRecords:
-      - !GetAtt JenkinsMaster0.PublicDnsName
-      Comment: !Sub 'Managed by CloudFormation stack: ${AWS::StackName}'
+        - !GetAtt AppLoadBalancer.DNSName
 
-  JenkinsMasterSecurityGroup:
+  MasterLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '${AWS::StackName}-JenkinsMaster'
+      RetentionInDays: 30
+
+  MasterEcsTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssmmessages:CreateControlChannel
+                  - ssmmessages:CreateDataChannel
+                  - ssmmessages:OpenControlChannel
+                  - ssmmessages:OpenDataChannel
+                Resource: '*'
+
+  MasterEcsExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: Allow ECS to store logs in logwach.
+      AssumeRolePolicyDocument:
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: ecs-tasks.amazonaws.com
+          Action: sts:AssumeRole
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  EcsCluster:
+    Type: AWS::ECS::Cluster
+
+  MasterEcsTask:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Cpu: 512
+      Memory: 1024
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+      - FARGATE
+      ContainerDefinitions:
+      - Name: chmod-jenkins-home
+        Essential: false
+        Image: public.ecr.aws/amazonlinux/amazonlinux:latest
+        Command:
+        - chown
+        - 1000:1000
+        - /var/jenkins_home
+        MountPoints:
+        - SourceVolume: jenkins-home
+          ContainerPath: /var/jenkins_home
+        LogConfiguration:
+          LogDriver: awslogs
+          Options:
+            awslogs-group: !Ref MasterLogGroup
+            awslogs-region: !Ref AWS::Region
+            awslogs-stream-prefix: jenkins-permissions
+      - Name: jenkins-master
+        Image: jenkins/jenkins:lts-jdk11
+        PortMappings:
+        - ContainerPort: 8080
+        DependsOn:
+        - ContainerName: chmod-jenkins-home
+          Condition: COMPLETE
+        MountPoints:
+        - SourceVolume: jenkins-home
+          ContainerPath: /var/jenkins_home
+        LogConfiguration:
+          LogDriver: awslogs
+          Options:
+            awslogs-group: !Ref MasterLogGroup
+            awslogs-region: !Ref AWS::Region
+            awslogs-stream-prefix: jenkins-master
+      ExecutionRoleArn: !Ref MasterEcsExecutionRole
+      TaskRoleArn: !Ref MasterEcsTaskRole
+      Volumes:
+      - Name: jenkins-home
+        EFSVolumeConfiguration:
+          FilesystemId: !Ref HomeFileSystem
+          TransitEncryption: ENABLED
+
+  MasterEcsService:
+    Type: AWS::ECS::Service
+    DependsOn: AlbHttpsListenerAdminRule
+    Properties:
+      Cluster: !Ref EcsCluster
+      DesiredCount: 1
+      TaskDefinition: !Ref MasterEcsTask
+      HealthCheckGracePeriodSeconds: 300
+      LaunchType: FARGATE
+      EnableExecuteCommand: true
+      LoadBalancers:
+      - TargetGroupArn: !Ref MasterTargetGroup
+        ContainerPort: 8080
+        ContainerName: jenkins-master
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          SecurityGroups: [ !Ref MasterSecurityGroup ]
+          Subnets: !Ref PrivateSubnetIds
+
+  MasterSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: Allow HTTPS access from Admin workstations.
+      GroupDescription: Allow the ALB to route traffic to Jenkins.
       VpcId: !Ref VpcId
       SecurityGroupIngress:
       - IpProtocol: tcp
-        FromPort: 443
-        ToPort: 443
-        CidrIp: '137.229.6.64/26'
-      - IpProtocol: tcp
-        FromPort: 443
-        ToPort: 443
-        # FIXME: Don't hard-code GitHub's security group in here.
-        SourceSecurityGroupId: 'sg-a225c0d8'
-      SecurityGroupEgress:
-      - IpProtocol: tcp
-        FromPort: 443
-        ToPort: 443
-        CidrIp: '0.0.0.0/0'
-      - IpProtocol: tcp
-        FromPort: 25
-        ToPort: 25
-        CidrIp: '0.0.0.0/0'
+        FromPort: 8080
+        ToPort: 8080
+        SourceSecurityGroupId: !Ref AlbSecurityGroup
 
-  EfsSecurityGroup:
+  HomeSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: Allow NFS from JenkinsMaster
+      GroupDescription: Allow Jenkins Master to mount Jenkins Home
       VpcId: !Ref VpcId
       SecurityGroupIngress:
-      # Receive NFS from Jenkins Server(s)
+      # Receive NFS from Jenkins Instances
       - IpProtocol: tcp
         FromPort: 2049
         ToPort: 2049
-        SourceSecurityGroupId: !Ref JenkinsMasterSecurityGroup
+        SourceSecurityGroupId: !Ref MasterSecurityGroup
 
-  EfsFileSystem:
+  HomeFileSystem:
     Type: AWS::EFS::FileSystem
     DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
+      Encrypted: true
       FileSystemTags:
         - Key: Name
           Value: !Sub ${AWS::StackName}-shared-filesystem
 
-  EfsMountTarget:
+  HomeMountTarget0:
     Type: AWS::EFS::MountTarget
     Properties:
-      FileSystemId: !Ref EfsFileSystem
-      SecurityGroups: [ !Ref EfsSecurityGroup ]
-      SubnetId: !Select [ 0, !Ref SubnetIds ]
+      FileSystemId: !Ref HomeFileSystem
+      SecurityGroups: [ !Ref HomeSecurityGroup ]
+      SubnetId: !Select [ 0, !Ref PrivateSubnetIds ]
 
-  EfsBackup:
-    Type: AWS::CloudFormation::Stack
+  HomeMountTarget1:
+    Type: AWS::EFS::MountTarget
+    Condition: Have2PrivateSubnets
     Properties:
-      TemplateURL: !Sub 'https://${PrivateBucket}.s3.amazonaws.com/efs-to-efs-backup.template.modified'
-      Parameters:
-        SrcEFS: !Ref EfsFileSystem
-        Retain: '35'
-        FolderLabel: jenkins-master
-        BackupSchedule: 'cron(0 12 * * ? *)'
-        SuccessNotification: 'No'
-        VpcId: !Ref VpcId
-        Subnets: !Join [',', !Ref SubnetIds ]
-        Email: ua-oit-ics-ice-notify@alaska.edu
+      FileSystemId: !Ref HomeFileSystem
+      SecurityGroups: [ !Ref HomeSecurityGroup ]
+      SubnetId: !Select [ 1, !Ref PrivateSubnetIds ]
 
-  EfsSecurityGroupBackupIngress:
-    Type: AWS::EC2::SecurityGroupIngress
+  HomeMountTarget2:
+    Type: AWS::EFS::MountTarget
+    Condition: Have3PrivateSubnets
     Properties:
-      IpProtocol: '-1'
-      FromPort: -1
-      ToPort: -1
-      GroupId: !Ref EfsSecurityGroup
-      SourceSecurityGroupId: !GetAtt [EfsBackup, Outputs.BackupSecurityGroup]
+      FileSystemId: !Ref HomeFileSystem
+      SecurityGroups: [ !Ref HomeSecurityGroup ]
+      SubnetId: !Select [ 2, !Ref PrivateSubnetIds ]
+
+  HomeMountTarget3:
+    Type: AWS::EFS::MountTarget
+    Condition: Have4PrivateSubnets
+    Properties:
+      FileSystemId: !Ref HomeFileSystem
+      SecurityGroups: [ !Ref HomeSecurityGroup ]
+      SubnetId: !Select [ 3, !Ref PrivateSubnetIds ]
