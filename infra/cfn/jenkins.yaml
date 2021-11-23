@@ -1,0 +1,221 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: >-
+  Template for deployment of the Jenkins Master.
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: Id of the VPC into which to deploy the Jenkins Master
+  SubnetIds:
+    Type: "List<AWS::EC2::Subnet::Id>"
+    Description: The subnet into which to deploy the Jenkins Master
+  AdminSecurityGroup:
+    Type: "AWS::EC2::SecurityGroup::Id"
+    Description: The subnet into which to deploy the Jenkins Master
+  JenkinsRole:
+    Type: String
+    Description: IAM Role with permission to read from the Private Bucket.
+  PrivateBucket:
+    Type: String
+    Description: S3 bucket containing secrets
+  Ec2KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: EC2 Key Pair to install on EC2 instances
+
+Resources:
+  JenkinsInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub '${AWS::StackName}-JenkinsMaster'
+      Roles: [ !Ref JenkinsRole ]
+
+  JenkinsMaster0:
+    Type: AWS::EC2::Instance
+    Metadata:
+      AWS::CloudFormation::Authentication:
+        S3AccessCreds:
+          type: S3
+          roleName: !Ref JenkinsRole
+          buckets: [ !Ref PrivateBucket ]
+      AWS::CloudFormation::Init:
+        config:
+          files:
+
+            /etc/secrets/jenkins.id_ed25519:
+              source: !Sub 'https://${PrivateBucket}.s3.amazonaws.com/jenkins.id_ed25519'
+              owner: root
+              group: root
+              mode: '000400'
+
+            /etc/secrets/jenkins.id_rsa:
+              source: !Sub 'https://${PrivateBucket}.s3.amazonaws.com/jenkins.id_rsa'
+              owner: root
+              group: root
+              mode: '000400'
+
+            /etc/pki/tls/certs/jenkins.pem:
+              source: !Sub 'https://${PrivateBucket}.s3.amazonaws.com/jenkins.pem'
+              owner: root
+              group: root
+              mode: '000644'
+
+            /etc/pki/tls/private/jenkins.key:
+              source: !Sub 'https://${PrivateBucket}.s3.amazonaws.com/jenkins.key'
+              owner: root
+              group: root
+              mode: '000400'
+
+            /etc/secrets/jdk-8u211-linux-x64.tar.gz:
+              source: !Sub 'https://${PrivateBucket}.s3.amazonaws.com/jdk-8u211-linux-x64.tar.gz'
+              owner: root
+              group: root
+              mode: '000400'
+
+            /etc/chef-repo/cfn_params.json:
+              content:
+                Fn::Join:
+                  - "\n"
+                  -
+                    - '{'
+                    -   '  "java": { "jdk": { "8": { "x86_64": { "url": "file:///etc/secrets/jdk-8u211-linux-x64.tar.gz" }}}},'
+                    - !Sub '  "tsos-app-jenkins-master": { "jenkins_share":"${EfsFileSystem}.efs.${AWS::Region}.amazonaws.com:/" }'
+                    - '}'
+              owner: root
+              group: root
+              mode: '000400'
+
+          sources:
+            /etc/chef-repo: !Sub 'https://${PrivateBucket}.s3.amazonaws.com/tsos-app-jenkins-master.tgz'
+
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT15M
+    DependsOn: EfsMountTarget
+    Properties:
+      ImageId: ami-01bbe152bf19d0289
+      InstanceType: 't3.small'
+      IamInstanceProfile: !Ref JenkinsInstanceProfile
+      NetworkInterfaces:
+      - DeviceIndex: '0'
+        GroupSet:
+        - !Ref AdminSecurityGroup
+        - !Ref JenkinsMasterSecurityGroup
+        SubnetId: !Select [ 0, !Ref SubnetIds ]
+      KeyName: !Ref Ec2KeyName
+      Tags:
+      - Key: Name
+        Value: !Sub '${AWS::StackName}-JenkinsMaster'
+      UserData:
+        Fn::Base64:
+          Fn::Sub: |-
+            #!/bin/bash -xe
+            exec &>>/var/log/userdata.log
+            env >/var/log/userdata.env
+            /opt/aws/bin/cfn-init -v -s ${AWS::StackName} -r JenkinsMaster0 --region ${AWS::Region}
+            curl -L https://omnitruck.chef.io/install.sh | sudo bash -s
+            cd /etc/chef-repo
+            # FIXME: Remove data bag dependency from tsos-config instead of setting TEST_KITCHEN env var.
+            CHEF_LICENSE=accept-no-persist chef-client -z -j cfn_params.json
+            /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource JenkinsMaster0 --region ${AWS::Region}
+            touch /userdata-successful
+
+  JenkinsEIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+
+  JenkinsEIPAssociation:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      AllocationId: !GetAtt JenkinsEIP.AllocationId
+      InstanceId: !Ref JenkinsMaster0
+
+  JenkinsDnsRecord:
+    Type: AWS::Route53::RecordSet
+    DependsOn: JenkinsEIPAssociation
+    # Condition: SomeCondition
+    Properties:
+      # FIXME: Make hostname configurable.
+      HostedZoneName: aws.alaska.edu.
+      Name: jenkins-19.aws.alaska.edu.
+      Type: CNAME
+      TTL: '900'
+      ResourceRecords:
+      - !GetAtt JenkinsMaster0.PublicDnsName
+      Comment: !Sub 'Managed by CloudFormation stack: ${AWS::StackName}'
+
+  JenkinsMasterSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTPS access from Admin workstations.
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: 443
+        ToPort: 443
+        CidrIp: '137.229.6.64/26'
+      - IpProtocol: tcp
+        FromPort: 443
+        ToPort: 443
+        # FIXME: Don't hard-code GitHub's security group in here.
+        SourceSecurityGroupId: 'sg-a225c0d8'
+      SecurityGroupEgress:
+      - IpProtocol: tcp
+        FromPort: 443
+        ToPort: 443
+        CidrIp: '0.0.0.0/0'
+      - IpProtocol: tcp
+        FromPort: 25
+        ToPort: 25
+        CidrIp: '0.0.0.0/0'
+
+  EfsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow NFS from JenkinsMaster
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+      # Receive NFS from Jenkins Server(s)
+      - IpProtocol: tcp
+        FromPort: 2049
+        ToPort: 2049
+        SourceSecurityGroupId: !Ref JenkinsMasterSecurityGroup
+
+  EfsFileSystem:
+    Type: AWS::EFS::FileSystem
+    DeletionPolicy: Retain
+    Properties:
+      FileSystemTags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-shared-filesystem
+
+  EfsMountTarget:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref EfsFileSystem
+      SecurityGroups: [ !Ref EfsSecurityGroup ]
+      SubnetId: !Select [ 0, !Ref SubnetIds ]
+
+  EfsBackup:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub 'https://${PrivateBucket}.s3.amazonaws.com/efs-to-efs-backup.template.modified'
+      Parameters:
+        SrcEFS: !Ref EfsFileSystem
+        Retain: '35'
+        FolderLabel: jenkins-master
+        BackupSchedule: 'cron(0 12 * * ? *)'
+        SuccessNotification: 'No'
+        VpcId: !Ref VpcId
+        Subnets: !Join [',', !Ref SubnetIds ]
+        Email: ua-oit-ics-ice-notify@alaska.edu
+
+  EfsSecurityGroupBackupIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      IpProtocol: '-1'
+      FromPort: -1
+      ToPort: -1
+      GroupId: !Ref EfsSecurityGroup
+      SourceSecurityGroupId: !GetAtt [EfsBackup, Outputs.BackupSecurityGroup]
