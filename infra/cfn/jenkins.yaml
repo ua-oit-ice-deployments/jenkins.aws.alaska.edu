@@ -40,6 +40,10 @@ Parameters:
     Type: List<String>
     Description: Addresses ranges for clients in CIDR notation.
 
+  JenkinsPubKey:
+    Type: String
+    Description: Public key used by Jenkins to login to agent machine.
+
 Conditions:
   Have2PrivateSubnets:
     !Not [!Equals ["", !Select [1, !Split [",", !Join ["", [!Join [",", !Ref PrivateSubnetIds], ",,,"]]]]]]
@@ -336,3 +340,124 @@ Resources:
       FileSystemId: !Ref HomeFileSystem
       SecurityGroups: [ !Ref HomeSecurityGroup ]
       SubnetId: !Select [ 3, !Ref PrivateSubnetIds ]
+
+  AgentSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow master to run tasks on agents.
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: 22
+        ToPort: 22
+        SourceSecurityGroupId: !Ref MasterSecurityGroup
+
+  # FIXME: Static agent for temporary use.  Fast and easy to get us going.
+  # Replace with on-demand agents for a more cost-effective solution.
+  # To make this work, you will need to:
+  # 1) Generate an SSH key pair
+  # 2) Launch this stack with the parameter JenkinsPubKey set to the public
+  #    key.
+  # 3) Create credentials in jenkins for the key pair and create the node
+  #    definition as described in:
+  #    https://www.jenkins.io/doc/book/using/using-agents/
+
+  TempAgentInstance:
+    Type: AWS::EC2::Instance
+    Metadata:
+      AWS::CloudFormation::Init:
+        SetupCfnHup:
+          files:
+            /etc/cfn/cfn-hup.conf:
+              content: !Sub |
+                [main]
+                stack=${AWS::StackId}
+                region=${AWS::Region}
+              mode: '000400'
+              owner: root
+              group: root
+            /etc/cfn/hooks.d/cfn-auto-reloader.conf:
+              content: !Sub |
+                [cfn-auto-reloader-hook]
+                triggers=post.update
+                path=Resources.TempAgentInstance.Metadata.AWS::CloudFormation::Init
+                action=/opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource TempAgentInstance --region ${AWS::Region}
+                runas=root
+          services:
+            sysvinit:
+              cfn-hup:
+                enabled: true
+                ensureRunning: true
+                files:
+                - /etc/cfn/cfn-hup.conf
+                - /etc/cfn/hooks.d/cfn-auto-reloader.conf
+        SetupRepos:
+          commands:
+            AddVagrantRepo:
+              command: yum-config-manager --add-repo https://rpm.releases.hashicorp.com/AmazonLinux/hashicorp.repo
+            EnableJavaRepo:
+              command: amazon-linux-extras enable java-openjdk11
+        InstallPackages:
+          packages:
+            yum:
+              git: []
+              java-11-openjdk: []
+              vagrant: []
+        InstallChefWorkstation:
+          commands:
+            InstallChefWorkstation:
+              test: '! which chef'
+              command: curl -L https://omnitruck.chef.io/install.sh | bash -s -- -P chef-workstation -v 21.11
+        CreateJenkinsUser:
+          commands:
+            CreateJenkinsUser:
+              test: '! id jenkins'
+              command: useradd -m -r jenkins
+        SetJenkinsSshKey:
+          files:
+            /home/jenkins/.ssh/authorized_keys:
+              content: !Ref JenkinsPubKey
+              owner: jenkins
+              group: jenkins
+              mode: '000400'
+          commands:
+            SshDirPermissions:
+              command: install -o jenkins -g jenkins -m 0700 -d /home/jenkins/.ssh
+        configSets:
+          default:
+          - SetupCfnHup
+          - SetupRepos
+          - InstallPackages
+          - InstallChefWorkstation
+          - CreateJenkinsUser
+          - SetJenkinsSshKey
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT10M
+    Properties:
+      # NOTE: CloudFormation may redeploy the agent instance if a new release
+      # of the amazon linux ami was released since the last stack update.
+      ImageId: '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2}}'
+      InstanceType: 't3.small'
+      NetworkInterfaces:
+      - DeviceIndex: '0'
+        GroupSet:
+        - !Ref AgentSecurityGroup
+        # This is temporary; just pin it to the first private subnet.
+        SubnetId: !Select [ 0, !Ref PrivateSubnetIds ]
+      KeyName: ice-key.2019-06-11
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -x
+          /opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource TempAgentInstance --region ${AWS::Region}
+          /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource TempAgentInstance --region ${AWS::Region}
+
+  # FIXME: Temporarily allow SSH into agent to help troubleshoot configuration.
+  TempAgentInstanceAccess:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref AgentSecurityGroup
+      IpProtocol: tcp
+      FromPort: 22
+      ToPort: 22
+      CidrIp: 10.0.0.0/8
