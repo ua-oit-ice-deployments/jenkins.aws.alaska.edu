@@ -120,24 +120,7 @@ Resources:
       Conditions:
       - Field: source-ip
         SourceIpConfig:
-          # Values: [ 137.229.6.64/26 ]
           Values: !Ref ClientCidrList
-
-  # FIXME: Temporarily allow UA for troubleshooting.
-  AlbHttpsListenerAdminRuleTMP:
-    Type: AWS::ElasticLoadBalancingV2::ListenerRule
-    Properties:
-      Priority: 11
-      ListenerArn: !Ref AlbHttpsListener
-      Actions:
-      - Type: forward
-        ForwardConfig:
-          TargetGroups:
-          - TargetGroupArn: !Ref MasterTargetGroup
-      Conditions:
-      - Field: source-ip
-        SourceIpConfig:
-          Values: [ 137.229.0.0/16 ]
 
   AlbHttpsListenerWebhookRule:
     Type: AWS::ElasticLoadBalancingV2::ListenerRule
