@@ -1,0 +1,219 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: >-
+  Infrastructure to support the use of EC2 with Test Kitchen.  Creates an
+  IAM user and access key that grants Test Kitchen the ability to run and
+  terminate its own EC2 instances.  Test Kitchen is limited to managing
+  instances that use the SSH key pair, security group, and tag described in
+  the stack outputs.  A scheduled job detects and terminates instances
+  created by Test Kitchen that have run for more than MaxInstanceLifetime
+  minutes.
+
+Parameters:
+  VpcId:
+    Description: Id of the VPC in which Test Kitchen can run instances.
+    Type:  AWS::EC2::VPC::Id
+
+  KitchenKey:
+    Description: Name of the key pair that Test Kitchen will use.
+    Type: AWS::EC2::KeyPair::KeyName
+
+  MaxInstanceLifetime:
+    Description: >-
+      Maximum amount of time (in minutes) for which a test instance is
+      expect to run.
+    Type: String
+    Default: "120"
+    AllowedPattern: "^[1-9][0-9]*$"
+
+  SourceSecurityGroupId:
+    Description: Id of the security group used by instances running Test Kitchen.
+    Type: String
+    Default: ""
+
+Conditions:
+  HaveSourceGroup: !Not [ !Equals [ "", !Ref SourceSecurityGroupId ] ]
+  NotHaveSourceGroup: !Equals [ "", !Ref SourceSecurityGroupId ]
+
+Resources:
+  SutSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allows Test Kitchen to access test instances.
+      VpcId: !Ref VpcId
+
+  SutIngressViaGroup:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: HaveSourceGroup
+    Properties:
+      GroupId: !GetAtt SutSecurityGroup.GroupId
+      Description: Allows all traffic from Test Kitchen.
+      IpProtocol: -1
+      SourceSecurityGroupId: !Ref SourceSecurityGroupId
+
+  SutIngressWithoutGroup:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: NotHaveSourceGroup
+    Properties:
+      GroupId: !GetAtt SutSecurityGroup.GroupId
+      Description: Allows SSH traffic.
+      # We currently use port 22, and not 3389, 5985, or 5986.
+      IpProtocol: tcp
+      FromPort: 22
+      ToPort: 22
+      CidrIp: 0.0.0.0/0
+
+  KitchenPolicy:
+    Type:  AWS::IAM::ManagedPolicy
+    Properties:
+      Description: >-
+        Allows creation and termination of Test Kitchen test instances.
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Action:
+          - ec2:DescribeVpcs
+          - ec2:DescribeImages
+          - ec2:DescribeInstances
+          Resource: "*"
+        - Effect: Allow
+          Action:
+          - ec2:RunInstances
+          Resource:
+          - !Sub arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:instance/*
+          Condition:
+            StringEquals:
+              aws:RequestTag/KitchenStack: !Sub ${AWS::StackName}
+        - Effect: Allow
+          Action:
+          - ec2:RunInstances
+          Resource:
+          - !Sub arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:security-group/${SutSecurityGroup}
+          - !Sub arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:key-pair/${KitchenKey}
+          - !Sub arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:volume/*
+          - !Sub arn:aws:ec2:${AWS::Region}:*:image/ami-*
+          - !Sub arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:network-interface/*
+          - !Sub arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:subnet/*
+        - Effect: Allow
+          Action: ec2:CreateTags
+          Resource: !Sub arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:*/*
+          Condition:
+            StringEquals:
+              ec2:CreateAction: RunInstances
+        - Effect: Allow
+          Action: ec2:TerminateInstances
+          Resource: "*"
+          Condition:
+            StringEquals:
+              aws:ResourceTag/KitchenStack: !Sub ${AWS::StackName}
+
+  KitchenUser:
+    Type: AWS::IAM::User
+    Properties:
+      ManagedPolicyArns:
+      - !Ref KitchenPolicy
+
+  KitchenAccessKey:
+    Type: AWS::IAM::AccessKey
+    Properties:
+      UserName: !Ref KitchenUser
+
+  KitchenCredentials:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      SecretString:
+        Fn::Join:
+        - ""
+        - - '{"accessKeyId":"'
+          - !Ref KitchenAccessKey
+          - '","secretAccessKey":"'
+          - !GetAtt [ KitchenAccessKey, SecretAccessKey ]
+          - '"}'
+
+  CleanupLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${AWS::StackName}-cleanup
+
+  CleanupRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: >-
+        Allows Kitchen Cleanup function to write logs and terminate
+        instances.
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          Effect: Allow
+          Principal:
+            Service: lambda.amazonaws.com
+          Action: sts:AssumeRole
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      - !Ref KitchenPolicy
+
+  CleanupLambda:
+    Type: AWS::Lambda::Function
+    DependsOn: CleanupLogs
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-cleanup"
+      Description: >-
+        Finds and terminates instances that Test Kitchen did not shutdown.
+      Handler: index.handler
+      Role: !GetAtt CleanupRole.Arn
+      Runtime: python3.9
+      Timeout: 10
+      Code:
+        ZipFile: !Sub |
+          from datetime import datetime, timedelta
+          from dateutil.tz import tzutc
+          import boto3
+          def handler(event, context):
+            nowutc = datetime.now(tzutc())
+            timeout = timedelta(minutes=event.get('timeout',${MaxInstanceLifetime}))
+            running = boto3.resource('ec2').instances.filter(Filters=[
+              {'Name': 'instance-state-name', 'Values': ['running']},
+              {'Name': 'tag:KitchenStack', 'Values': ['${AWS::StackName}']}
+            ])
+            for instance in running:
+              if instance.launch_time < (nowutc - timeout):
+                print("Removing timed out Test Kitchen instance: " + instance.instance_id)
+                instance.terminate()
+
+  CleanupSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      ScheduleExpression: "rate(15 minutes)"
+      Targets:
+      - Arn: !GetAtt CleanupLambda.Arn
+        Id: CleanupLambda
+
+  CleanupPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt CleanupLambda.Arn
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt CleanupSchedule.Arn
+
+Outputs:
+  RequiredKeyPair:
+    Description: SSH Key Pair used to access test instances.
+    Value: !Ref KitchenKey
+
+  RequiredSecurityGroup:
+    Description: ID of Security Group to use when creating test instances.
+    Value: !GetAtt SutSecurityGroup.GroupId
+
+  RequiredTagKey:
+    Description: Tag to set when creating test instances.
+    Value: KitchenStack
+
+  RequiredTagValue:
+    Description: Value to set for tag when creating test instances.
+    Value: !Sub ${AWS::StackName}
+
+  UserCredentialsSecret:
+    Description: ARN of secret holding the access key for Test Kitchen.
+    Value: !Ref KitchenCredentials
