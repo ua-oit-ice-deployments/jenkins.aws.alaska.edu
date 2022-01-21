@@ -44,6 +44,15 @@ Parameters:
     Type: String
     Description: Public key used by Jenkins to login to agent machine.
 
+  ConfigUri:
+    Type: String
+    Description: URI containing `plugins` & `jenkins.casc.yaml` for Jenkins.
+    Default: https://raw.githubusercontent.com/ua-oit-ice-deployments/jenkins.aws.alaska.edu/master/config
+
+  SecretsJsonArn:
+    Type: String
+    Description: Name of JSON dictionary storing credentials in secrets manager.
+
 Conditions:
   Have2PrivateSubnets:
     !Not [!Equals ["", !Select [1, !Split [",", !Join ["", [!Join [",", !Ref PrivateSubnetIds], ",,,"]]]]]]
@@ -188,6 +197,14 @@ Resources:
           Action: sts:AssumeRole
       ManagedPolicyArns:
       - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+      - PolicyName: read-jenkins-secrets
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action: secretsmanager:GetSecretValue
+            Resource: !Ref SecretsJsonArn
 
   EcsCluster:
     Type: AWS::ECS::Cluster
@@ -200,46 +217,105 @@ Resources:
       NetworkMode: awsvpc
       RequiresCompatibilities:
       - FARGATE
+      ExecutionRoleArn: !GetAtt MasterEcsExecutionRole.Arn
+      TaskRoleArn: !GetAtt MasterEcsTaskRole.Arn
+      Volumes:
+      - Name: jenkins-home
+      - Name: run-secrets
+      - Name: jenkins-jobs
+        EFSVolumeConfiguration:
+          FilesystemId: !Ref JobsFileSystem
+          TransitEncryption: ENABLED
       ContainerDefinitions:
-      - Name: chmod-jenkins-home
+
+      - Name: permissions-sidecar
         Essential: false
         Image: public.ecr.aws/amazonlinux/amazonlinux:latest
         Command:
         - chown
+        - -R
         - 1000:1000
         - /var/jenkins_home
         MountPoints:
-        - SourceVolume: jenkins-home
-          ContainerPath: /var/jenkins_home
+        - ContainerPath: /var/jenkins_home
+          SourceVolume: jenkins-home
+        - ContainerPath: /var/jenkins_home/jobs
+          SourceVolume: jenkins-jobs
         LogConfiguration:
           LogDriver: awslogs
           Options:
             awslogs-group: !Ref MasterLogGroup
             awslogs-region: !Ref AWS::Region
-            awslogs-stream-prefix: jenkins-permissions
+            awslogs-stream-prefix: permissions-sidecar
+
+      - Name: secrets-sidecar
+        Image: docker/ecs-secrets-sidecar:latest
+        Command:
+        - '[{"Name":"jenkins","Keys":["*"]}]'
+        Essential: false
+        MountPoints:
+        - ContainerPath: /run/secrets
+          SourceVolume: run-secrets
+        LogConfiguration:
+          LogDriver: awslogs
+          Options:
+            awslogs-group: !Ref MasterLogGroup
+            awslogs-region: !Ref AWS::Region
+            awslogs-stream-prefix: secrets-sidecar
+        Secrets:
+        - Name: jenkins
+          ValueFrom: !Ref SecretsJsonArn
+
+      - Name: plugins-sidecar
+        Image: jenkins/jenkins:lts-jdk11
+        EntryPoint:
+        - /bin/sh
+        - -c
+        - !Sub "jenkins-plugin-cli -d /var/jenkins_home/plugins --verbose --plugins $(curl -s '${ConfigUri}/plugins')"
+        DependsOn:
+        - ContainerName: permissions-sidecar
+          Condition: COMPLETE
+        - ContainerName: secrets-sidecar
+          Condition: COMPLETE
+        Essential: false
+        MountPoints:
+        - ContainerPath: /var/jenkins_home
+          SourceVolume: jenkins-home
+        LogConfiguration:
+          LogDriver: awslogs
+          Options:
+            awslogs-group: !Ref MasterLogGroup
+            awslogs-region: !Ref AWS::Region
+            awslogs-stream-prefix: plugins-sidecar
+
       - Name: jenkins-master
         Image: jenkins/jenkins:lts-jdk11
+        DependsOn:
+        - ContainerName: plugins-sidecar
+          Condition: COMPLETE
         PortMappings:
         - ContainerPort: 8080
-        DependsOn:
-        - ContainerName: chmod-jenkins-home
-          Condition: COMPLETE
+        Environment:
+        - Name: JAVA_OPTS
+          Value: -Djenkins.install.runSetupWizard=false
+        - Name: CASC_JENKINS_CONFIG
+          Value: !Sub ${ConfigUri}/jenkins.casc.yaml
+        - Name: SECRETS
+          Value: /run/secrets/jenkins
         MountPoints:
-        - SourceVolume: jenkins-home
-          ContainerPath: /var/jenkins_home
+        - ContainerPath: /var/jenkins_home
+          SourceVolume: jenkins-home
+        - ContainerPath: /var/jenkins_home/jobs
+          SourceVolume: jenkins-jobs
+        - ContainerPath: /run/secrets
+          ReadOnly: true
+          SourceVolume: run-secrets
         LogConfiguration:
           LogDriver: awslogs
           Options:
             awslogs-group: !Ref MasterLogGroup
             awslogs-region: !Ref AWS::Region
             awslogs-stream-prefix: jenkins-master
-      ExecutionRoleArn: !Ref MasterEcsExecutionRole
-      TaskRoleArn: !Ref MasterEcsTaskRole
-      Volumes:
-      - Name: jenkins-home
-        EFSVolumeConfiguration:
-          FilesystemId: !Ref HomeFileSystem
-          TransitEncryption: ENABLED
 
   MasterEcsService:
     Type: AWS::ECS::Service
@@ -271,7 +347,7 @@ Resources:
         ToPort: 8080
         SourceSecurityGroupId: !Ref AlbSecurityGroup
 
-  HomeSecurityGroup:
+  JobsSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
       GroupDescription: Allow Jenkins Master to mount Jenkins Home
@@ -283,45 +359,43 @@ Resources:
         ToPort: 2049
         SourceSecurityGroupId: !Ref MasterSecurityGroup
 
-  HomeFileSystem:
+  JobsFileSystem:
     Type: AWS::EFS::FileSystem
-    DeletionPolicy: Retain
-    UpdateReplacePolicy: Retain
     Properties:
       Encrypted: true
       FileSystemTags:
         - Key: Name
           Value: !Sub ${AWS::StackName}-shared-filesystem
 
-  HomeMountTarget0:
+  JobsMountTarget0:
     Type: AWS::EFS::MountTarget
     Properties:
-      FileSystemId: !Ref HomeFileSystem
-      SecurityGroups: [ !Ref HomeSecurityGroup ]
+      FileSystemId: !Ref JobsFileSystem
+      SecurityGroups: [ !Ref JobsSecurityGroup ]
       SubnetId: !Select [ 0, !Ref PrivateSubnetIds ]
 
-  HomeMountTarget1:
+  JobsMountTarget1:
     Type: AWS::EFS::MountTarget
     Condition: Have2PrivateSubnets
     Properties:
-      FileSystemId: !Ref HomeFileSystem
-      SecurityGroups: [ !Ref HomeSecurityGroup ]
+      FileSystemId: !Ref JobsFileSystem
+      SecurityGroups: [ !Ref JobsSecurityGroup ]
       SubnetId: !Select [ 1, !Ref PrivateSubnetIds ]
 
-  HomeMountTarget2:
+  JobsMountTarget2:
     Type: AWS::EFS::MountTarget
     Condition: Have3PrivateSubnets
     Properties:
-      FileSystemId: !Ref HomeFileSystem
-      SecurityGroups: [ !Ref HomeSecurityGroup ]
+      FileSystemId: !Ref JobsFileSystem
+      SecurityGroups: [ !Ref JobsSecurityGroup ]
       SubnetId: !Select [ 2, !Ref PrivateSubnetIds ]
 
-  HomeMountTarget3:
+  JobsMountTarget3:
     Type: AWS::EFS::MountTarget
     Condition: Have4PrivateSubnets
     Properties:
-      FileSystemId: !Ref HomeFileSystem
-      SecurityGroups: [ !Ref HomeSecurityGroup ]
+      FileSystemId: !Ref JobsFileSystem
+      SecurityGroups: [ !Ref JobsSecurityGroup ]
       SubnetId: !Select [ 3, !Ref PrivateSubnetIds ]
 
   AgentSecurityGroup:
@@ -390,7 +464,7 @@ Resources:
           commands:
             InstallChefWorkstation:
               test: '! which chef'
-              command: curl -L https://omnitruck.chef.io/install.sh | bash -s -- -P chef-workstation -v 21.11
+              command: curl -L https://omnitruck.chef.io/install.sh | bash -s -- -P chef-workstation -v 22.1.745
         CreateJenkinsUser:
           commands:
             CreateJenkinsUser:

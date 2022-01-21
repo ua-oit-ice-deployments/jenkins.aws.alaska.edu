@@ -1,0 +1,10 @@
+configuration-as-code:latest
+job-dsl:latest
+matrix-auth:latest
+github-branch-source:latest
+remote-file:latest
+workflow-aggregator:latest
+blueocean:latest
+pipeline-utility-steps:latest
+ssh-slaves:latest
+timestamper:latest

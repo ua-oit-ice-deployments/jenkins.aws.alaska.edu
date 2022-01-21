@@ -1,0 +1,228 @@
+# Jenkins Configuration for the "Configuration as Code" (aka CasC) plugin.
+#
+# Each time the Jenkins starts in a fresh container, it uses the contents
+# of this file to configures itself and its plugins.
+
+jenkins:
+
+  # GitHub directs users to jenkins for additional build information.
+  # We allow anonymous users to view build results so they can see for
+  # themselves why Jenkins rejected their pull request without needing to
+  # contact someone from our team (provided they are on a network that can
+  # access Jenkins).
+  #
+  # The devops account allows us to perform routine maintenance (e.g.
+  # restarting builds affected by external failures, reconnecting agents
+  # after networks failures, etc.) without risking changes to the local
+  # configurations that are managed in code.
+  #
+  # The admin account has full control of everything.  While we manage the
+  # configuration of Jenkins in code, exceptional situations may occur in
+  # which we require elevated privileges in order to troubleshoot issues we
+  # can't reproduce in non-production environments, or "unwedge" something
+  # we could not fix in the code.
+
+  securityRealm:
+    local:
+      users:
+        - id: admin
+          password: "${ADMIN_PASSWORD}"
+        - id: devops
+          password: "${DEVOPS_PASSWORD}"
+
+  authorizationStrategy:
+    globalMatrix:
+      permissions:
+      - "USER:Overall/Administer:admin"
+
+      - "USER:Overall/Read:devops"
+      - "USER:Agent/Connect:devops"
+      - "USER:Job/Build:devops"
+      - "USER:Job/Cancel:devops"
+      - "USER:Job/Workspace:devops"
+      - "USER:Run/Replay:devops"
+      - "USER:Run/Update:devops"
+      - "USER:Lockable Resources/Reserve:devops"
+      - "USER:Lockable Resources/Unlock:devops"
+
+      - "USER:Overall/Read:anonymous"
+      - "USER:Job/Read:anonymous"
+      - "USER:View/Read:anonymous"
+
+  # Day to day activities shouldn't require authentication.
+  disableRememberMe: true
+
+  # Running jobs on the master, where they can read all of the controller's
+  # config files, is a good way to leak sensitive information, and strongly
+  # discouraged.
+  numExecutors: 0
+
+  # We are temporarily using a permanent agent until we have time to
+  # configure kubernetes agents in AWS.
+  nodes:
+  - permanent:
+      name: "ip-10-11-4-19.us-west-2.compute.internal"
+      nodeDescription: "Temporary Agent"
+      numExecutors: 4
+      remoteFS: "/home/jenkins"
+      launcher:
+        ssh:
+          credentialsId: jenkins-ssh
+          host: ip-10-11-4-19.us-west-2.compute.internal
+          sshHostKeyVerificationStrategy:
+            manuallyProvidedKeyVerificationStrategy:
+              key: "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDoJKzZ1dsidNOlc6PYry3vh0OqVUABRvdA+eTTLfJ2htOo0NArDuQfHE6oDKqfPvCcR6fux8mZKZEEiBWipwD1wvlZEswI8ajZnXoJi8kLZ1zhTPcHk0PcldFTUHMrK7/rKvyyExQqzBwiZl4JFlyku4RXfdsu/v+sMHe4hcox/nxuU9tGQaKuA0EHUiXD2rHvrI5cekBGwQQhMqNO4HXGKfP8650HNJ26AumbQquuvkaKty24Pz481ii3EJitme59FyCry4dEidZyBipKcWmuHNUnLwVqwZtkA5uWdqLeEJ+dPmwTbdNzbSmSqKnMRf0Tz1F+fAtQoBfxAFl9rEbL"
+
+  # CloudBees strongly recommends enabling Agent -> Controller security.
+  remotingSecurity:
+    enabled: true
+
+unclassified:
+
+  # Jenkins needs to know how to reference itself behind the load balancer.
+  location:
+    url: https://jenkins.aws.alaska.edu/
+
+  # Timestamps help identify long-running processes in pipelines, which
+  # negatively impact a team's velocity.
+  timestamper:
+    allPipelines: true
+
+credentials:
+  system:
+    domainCredentials:
+    - credentials:
+      - basicSSHUserPrivateKey:
+          # FIXME: Remove this credential once we move from static SSH
+          #        agents to dynamically provisioned agents.
+          description: SSH Key used by Jenkins for managing agents [SYSTEM]
+          id: jenkins-ssh
+          privateKeySource:
+            directEntry:
+              privateKey: "${AGENT_SSH_KEY}"
+          scope: SYSTEM
+          username: jenkins
+      # FIXME: All credentials except jenkins-ssh belong at the folder
+      #        level.  Move them back if the job-dsl plugin ever figures
+      #        out how to handle basic secrets, or gets replaced.
+      - usernamePassword:
+          id: ua-oit-jenkins
+          description: GitHub Service Account
+          scope: GLOBAL
+          username: ua-oit-jenkins
+          password: "${GITHUB_TOKEN}"
+      - file:
+          id: chef-client-key
+          description: Client key for the Jenkins user on Chef
+          scope: GLOBAL
+          fileName: client.pem
+          # Prefix with new-line to work around interpolation bug
+          secretBytes: "${base64:\n${CHEF_CLIENT_PEM}}"
+      - file:
+          id: kitchen-ec2-ssh-key
+          description: SSH key used to connect to Test Kitchen EC2 instances
+          scope: GLOBAL
+          fileName: id_rsa.kitchen-ec2
+          # Prefix with new-line to work around interpolation bug
+          secretBytes: "${base64:\n${KITCHEN_SSH_KEY}}"
+      - string:
+          id: kitchen-ec2-key-id
+          description: AWS Access Key Id for Test Kitchen EC2
+          scope: GLOBAL
+          secret: "${KITCHEN_EC2_KEY_ID}"
+      - string:
+          id: kitchen-ec2-secret-key
+          description: AWS Secret Access Key for Test Kitchen EC2
+          scope: GLOBAL
+          secret: "${KITCHEN_EC2_SECRET}"
+
+jobs:
+  - script: |
+      def create_ua_orgfolder(foldername, repoowner) {
+        organizationFolder(foldername) {
+          organizations {
+            github {
+              apiUri('https://api.github.com')
+              credentialsId('ua-oit-jenkins')
+              repoOwner(repoowner)
+              traits {
+                gitHubExcludeArchivedRepositories()
+                gitHubIgnoreDraftPullRequestFilter()
+                gitHubBranchDiscovery {
+                  strategyId(1)
+                }
+                // // This does not work as designed (see JENKINS-60874).
+                // gitHubForkDiscovery {
+                //   strategyId(1)
+                //   trust(gitHubTrustPermissions())
+                // }
+              }
+            }
+          }
+          projectFactories {
+            remoteJenkinsFileWorkflowMultiBranchProjectFactory {
+              localMarker('uabuild/config.yaml')
+              remoteJenkinsFile('Jenkinsfile')
+              matchBranches(false)
+              remoteJenkinsFileSCM {
+                gitSCM {
+                  userRemoteConfigs {
+                    userRemoteConfig {
+                      url('https://github.com/ua-oit-devops/jenkins-pipeline-library.git')
+                      credentialsId('ua-oit-jenkins')
+                      name('')            // required but not configured
+                      refspec('')         // required but not configured
+                    }
+                  }
+                  gitTool('')             // required but not configured
+                  browser {}              // required but not configured
+                }
+              }
+            }
+          }
+          triggers {
+            periodicFolderTrigger {
+              interval("1d")
+            }
+          }
+          configure {
+            // Workaround for JENKINS-60874:
+            def traits = it / navigators / 'org.jenkinsci.plugins.github__branch__source.GitHubSCMNavigator' / traits
+            traits << 'org.jenkinsci.plugins.github_branch_source.ForkPullRequestDiscoveryTrait' {
+              strategyId(1)
+              trust(class: 'org.jenkinsci.plugins.github_branch_source.ForkPullRequestDiscoveryTrait$TrustPermission')
+            }
+          }
+        }
+      }
+
+      folder('github.com') {
+        displayName('GitHub.com')
+        description('Projects hosted by GitHub.')
+        properties {
+          folderLibraries {
+            libraries {
+              libraryConfiguration {
+                name('jenkins-pipeline-library')
+                defaultVersion('master')
+                allowVersionOverride(false)
+                retriever {
+                  modernSCM {
+                    scm {
+                      git {
+                        remote('https://github.com/ua-oit-devops/jenkins-pipeline-library.git')
+                        credentialsId('ua-oit-jenkins')
+                        traits {
+                          gitBranchDiscovery()
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+      create_ua_orgfolder('github.com/ice-cookbooks', 'ua-oit-ice-cookbooks')
+      create_ua_orgfolder('github.com/ice-deployments', 'ua-oit-ice-deployments')
