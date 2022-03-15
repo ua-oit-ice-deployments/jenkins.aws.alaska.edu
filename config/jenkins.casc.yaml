@@ -61,17 +61,17 @@ jenkins:
   # configure kubernetes agents in AWS.
   nodes:
   - permanent:
-      name: "ip-10-11-4-19.us-west-2.compute.internal"
+      name: "ip-10-11-4-255.us-west-2.compute.internal"
       nodeDescription: "Temporary Agent"
       numExecutors: 4
       remoteFS: "/home/jenkins"
       launcher:
         ssh:
           credentialsId: jenkins-ssh
-          host: ip-10-11-4-19.us-west-2.compute.internal
+          host: ip-10-11-4-255.us-west-2.compute.internal
           sshHostKeyVerificationStrategy:
             manuallyProvidedKeyVerificationStrategy:
-              key: "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDoJKzZ1dsidNOlc6PYry3vh0OqVUABRvdA+eTTLfJ2htOo0NArDuQfHE6oDKqfPvCcR6fux8mZKZEEiBWipwD1wvlZEswI8ajZnXoJi8kLZ1zhTPcHk0PcldFTUHMrK7/rKvyyExQqzBwiZl4JFlyku4RXfdsu/v+sMHe4hcox/nxuU9tGQaKuA0EHUiXD2rHvrI5cekBGwQQhMqNO4HXGKfP8650HNJ26AumbQquuvkaKty24Pz481ii3EJitme59FyCry4dEidZyBipKcWmuHNUnLwVqwZtkA5uWdqLeEJ+dPmwTbdNzbSmSqKnMRf0Tz1F+fAtQoBfxAFl9rEbL"
+              key: "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQCg9MweNyjp9bTQ4APcLcEC2xIOXhI28aUjBwPvTimvncz6NJMQdBAHnUDFnk9OlJ2Z/fYYkk30wqUIPoBgzH+Uoesq8o6YVh4zeyJocckICUm/h5sZdYWDPuSovqvjHRrJOqdqEtg5Sz8mHFyrzMI/9v0jEtjOPC20WdFt3vHrDe8roMNByyHc2I+EkbqxFECu4Wompn5XvKb4iZAgm/hI4ENy+Lo97ZbdNKPCaFKOPVUAB4e/LL7todhKHOnAxK8jtB3dsRBOafLonx3My13SazYrkxw9n2WHjfJw+2JMio2rn8W0t0dg67apXDWBu3ocJYgtFstZe5YO5mgAEuSz"
 
   # CloudBees strongly recommends enabling Agent -> Controller security.
   remotingSecurity:

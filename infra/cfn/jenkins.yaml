@@ -363,6 +363,8 @@ Resources:
     Type: AWS::EFS::FileSystem
     Properties:
       Encrypted: true
+      BackupPolicy:
+        Status: ENABLED
       FileSystemTags:
         - Key: Name
           Value: !Sub ${AWS::StackName}-shared-filesystem
@@ -464,7 +466,7 @@ Resources:
           commands:
             InstallChefWorkstation:
               test: '! which chef'
-              command: curl -L https://omnitruck.chef.io/install.sh | bash -s -- -P chef-workstation -v 22.1.745
+              command: curl -L https://omnitruck.chef.io/install.sh | bash -s -- -P chef-workstation -v 22.2.807
         CreateJenkinsUser:
           commands:
             CreateJenkinsUser:
