@@ -161,7 +161,7 @@ jobs:
           }
           projectFactories {
             remoteJenkinsFileWorkflowMultiBranchProjectFactory {
-              localMarker('uabuild/config.yaml')
+              localMarker('uabuild.yaml')
               remoteJenkinsFile('Jenkinsfile')
               matchBranches(false)
               remoteJenkinsFileSCM {
